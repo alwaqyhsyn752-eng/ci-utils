@@ -1,0 +1,46 @@
+name: Disposable Masscan Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Target IP range / CIDR or single IP'
+        required: true
+        default: '187.77.0.0/16'
+      ports:
+        description: 'Ports to scan (e.g. 11434,80,8080)'
+        required: true
+        default: '11434'
+      rate:
+        description: 'Packet rate (PPS)'
+        required: true
+        default: '10000'
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install Masscan
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y masscan
+
+      - name: Run Masscan
+        run: |
+          echo "Starting Masscan sweep on ${{ github.event.inputs.target }} for ports ${{ github.event.inputs.ports }} @ ${{ github.event.inputs.rate }} pps..."
+          sudo masscan -p${{ github.event.inputs.ports }} ${{ github.event.inputs.target }} --rate ${{ github.event.inputs.rate }} -oJ hits.json || true
+          
+          if [ -f hits.json ]; then
+            echo "Masscan finished. Found $(grep -c '"ip"' hits.json 2>/dev/null || echo 0) raw open ports."
+          else
+            echo "[]" > hits.json
+          fi
+
+      - name: Upload Scan Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: masscan-hits-${{ github.run_id }}
+          path: hits.json
