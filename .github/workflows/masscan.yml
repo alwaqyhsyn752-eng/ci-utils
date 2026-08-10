@@ -1,4 +1,4 @@
-name: Disposable Masscan Runner
+name: Multi-Port Masscan Runner
 
 on:
   workflow_dispatch:
@@ -8,9 +8,9 @@ on:
         required: true
         default: '187.77.0.0/16'
       ports:
-        description: 'Ports to scan (e.g. 11434,80,8080)'
+        description: 'Ports to scan (e.g. 11434,8080,4000,5000,8000)'
         required: true
-        default: '11434'
+        default: '11434,8080,4000,5000,8000'
       rate:
         description: 'Packet rate (PPS)'
         required: true
@@ -28,7 +28,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y masscan
 
-      - name: Run Masscan
+      - name: Run Masscan Sweep
         run: |
           echo "Starting Masscan sweep on ${{ github.event.inputs.target }} for ports ${{ github.event.inputs.ports }} @ ${{ github.event.inputs.rate }} pps..."
           sudo masscan -p${{ github.event.inputs.ports }} ${{ github.event.inputs.target }} --rate ${{ github.event.inputs.rate }} -oJ hits.json || true
