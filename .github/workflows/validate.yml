@@ -1,0 +1,31 @@
+name: 4-Prompt Ollama Host Validator
+
+on:
+  workflow_dispatch:
+    inputs:
+      hosts:
+        description: 'Comma-separated host:port list to validate'
+        required: true
+      model:
+        description: 'Model name to validate on each host'
+        required: true
+        default: 'kimi-k2.6:cloud'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Run 4-prompt validation
+        run: |
+          python3 validate_hosts.py \
+            --hosts "${{ github.event.inputs.hosts }}" \
+            --model "${{ github.event.inputs.model }}"
+
+      - name: Upload validation results
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-results-${{ github.run_id }}
+          path: validation_results.json
