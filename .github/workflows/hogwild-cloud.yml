@@ -1,0 +1,151 @@
+name: Hogwild Cloud Ollama Hunter
+
+on:
+  workflow_dispatch:
+    inputs:
+      rate:
+        description: 'Packet rate (PPS)'
+        required: true
+        default: '10000'
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y masscan jq
+          pip install httpx
+
+      - name: Run Masscan on cloud CIDRs for :11434
+        run: |
+          # Major cloud provider CIDRs where Ollama instances live
+          cat > targets.txt << 'CIDRS'
+          5.9.0.0/16
+          5.75.0.0/16
+          49.12.0.0/16
+          49.13.0.0/16
+          65.108.0.0/16
+          65.109.0.0/16
+          78.46.0.0/16
+          88.198.0.0/16
+          94.23.0.0/16
+          136.243.0.0/16
+          136.244.0.0/16
+          142.132.0.0/16
+          148.251.0.0/16
+          159.69.0.0/16
+          164.92.0.0/16
+          167.172.0.0/16
+          167.71.0.0/16
+          188.166.0.0/16
+          45.32.0.0/16
+          45.63.0.0/16
+          45.76.0.0/16
+          45.84.0.0/16
+          51.75.0.0/16
+          51.77.0.0/16
+          51.79.0.0/16
+          51.91.0.0/16
+          54.36.0.0/16
+          54.38.0.0/16
+          57.128.0.0/16
+          62.210.0.0/16
+          91.134.0.0/16
+          92.4.0.0/16
+          92.5.0.0/16
+          84.8.0.0/16
+          89.168.0.0/16
+          130.61.0.0/16
+          152.70.0.0/16
+          158.69.0.0/16
+          163.176.0.0/16
+          187.77.0.0/16
+          194.163.0.0/16
+          198.27.0.0/16
+          207.211.0.0/16
+          217.142.0.0/16
+          CIDRS
+
+          echo "=== Starting masscan on $(wc -l < targets.txt) CIDRs for :11434 ==="
+          sudo masscan -p11434 -iL targets.txt --rate ${{ github.event.inputs.rate }} -oJ hits.json || true
+
+          if [ -f hits.json ] && grep -q '"ip"' hits.json; then
+            HITS=$(grep -c '"ip"' hits.json)
+            echo "Masscan found $HITS hosts with :11434 open"
+          else
+            echo "[]" > hits.json
+            echo "No hits found"
+          fi
+
+      - name: Tag-probe all hits for :cloud models
+        run: |
+          python3 << 'PYEOF'
+          import json, httpx, sys
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+
+          hits = []
+          try:
+              with open("hits.json") as f:
+                  raw = f.read().strip()
+              if raw:
+                  hits = [h["ip"] for h in json.loads(raw) if "ip" in h]
+          except Exception as e:
+              print(f"parse error: {e}")
+
+          print(f"Tag-probing {len(hits)} hosts for :cloud models", flush=True)
+
+          def probe(ip):
+              try:
+                  r = httpx.get(f"http://{ip}:11434/api/tags", timeout=5,
+                                headers={"User-Agent": "curl/8"})
+                  if r.status_code != 200:
+                      return None
+                  names = [m["name"] for m in r.json().get("models", [])]
+                  cloud = [n for n in names if ":cloud" in n]
+                  if cloud:
+                      return (ip, cloud, names)
+              except Exception:
+                  pass
+              return None
+
+          cloud_hosts = {}
+          all_models = set()
+          with ThreadPoolExecutor(max_workers=50) as ex:
+              futs = {ex.submit(probe, ip): ip for ip in hits}
+              done = 0
+              for fut in as_completed(futs):
+                  done += 1
+                  res = fut.result()
+                  if res:
+                      ip, clouds, names = res
+                      for m in clouds:
+                          cloud_hosts.setdefault(m, []).append(f"http://{ip}:11434")
+                      all_models.update(names)
+                      print(f"  CLOUD-HIT {ip}: {clouds}", flush=True)
+                  if done % 200 == 0:
+                      print(f"  ...{done}/{len(hits)} probed, {len(cloud_hosts)} cloud models found", flush=True)
+
+          # Write results
+          with open("cloud_hosts.json", "w") as f:
+              json.dump(cloud_hosts, f, indent=2)
+
+          print(f"\n=== CLOUD MODEL SUMMARY ===")
+          for model, hosts in sorted(cloud_hosts.items(), key=lambda x: -len(x[1])):
+              print(f"  {model}: {len(hosts)} hosts")
+          print(f"\nTotal unique :cloud models: {len(cloud_hosts)}")
+          print(f"Total hosts with cloud models: {sum(len(v) for v in cloud_hosts.values())}")
+          PYEOF
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hogwild-cloud-${{ github.run_id }}
+          path: |
+            hits.json
+            cloud_hosts.json
