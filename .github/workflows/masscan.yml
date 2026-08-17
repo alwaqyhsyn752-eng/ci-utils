@@ -6,7 +6,7 @@ on:
       target:
         description: 'Target IP range / CIDR or single IP'
         required: true
-        default: '187.77.0.0/16'
+        default: '43.133.0.0/16 43.153.0.0/16'
       ports:
         description: 'Ports to scan'
         required: true
@@ -45,7 +45,7 @@ jobs:
             echo "[]" > hits.json
           fi
 
-      - name: In-Runner Async Probing & 4-Prompt Validation
+      - name: In-Runner Multi-Path Probing & 4-Prompt Validation
         run: |
           python3 - << 'EOF'
           import json, asyncio, aiohttp, time, os
@@ -57,14 +57,12 @@ jobs:
               ("creative_short", "Write a 1-sentence thought about the ocean at night.")
           ]
 
-          # Load masscan hits
           hits = []
           try:
               hits = json.load(open("hits.json"))
           except Exception as e:
               print(f"Error loading hits.json: {e}")
 
-          # Format IP:port
           target_set = set()
           non_llm_infra = []
           for h in hits:
@@ -87,7 +85,7 @@ jobs:
               ip, port_str = target.split(":")
               port = int(port_str)
               
-              # 1. Ollama
+              # 1. Ollama on 11434
               if port == 11434:
                   url = f"http://{ip}:{port}/api/tags"
                   try:
@@ -96,44 +94,66 @@ jobs:
                               data = await r.json()
                               models = [m.get("name") for m in data.get("models", []) if isinstance(m, dict) and m.get("name")]
                               if models:
-                                  return {"host": target, "ip": ip, "port": port, "type": "ollama", "models": models}
+                                  return {"host": target, "ip": ip, "port": port, "type": "ollama", "models": models, "endpoint_path": "/api/tags"}
                   except:
                       pass
                   return None
 
-              # 2. OpenAI / vLLM / SGLang / Routers
-              url = f"http://{ip}:{port}/v1/models"
-              try:
-                  async with session.get(url, timeout=aiohttp.ClientTimeout(total=3.5, connect=1.5)) as r:
-                      if r.status == 200:
-                          data = await r.json()
-                          raw_m = data.get("data") or data.get("models") or []
-                          models = []
-                          is_sglang = False
-                          for m in raw_m:
-                              if isinstance(m, dict):
-                                  mid = m.get("id") or m.get("name")
-                                  if mid:
-                                      models.append(mid)
-                                  if m.get("owned_by") == "sglang":
-                                      is_sglang = True
-                              elif isinstance(m, str):
-                                  models.append(m)
-                          if models:
-                              return {"host": target, "ip": ip, "port": port, "type": "sglang_native" if is_sglang else "openai_compatible", "models": models}
-              except:
-                  pass
+              # 2. LiteLLM /model/info (Specialized LiteLLM Router Probe)
+              if port == 4000:
+                  try:
+                      async with session.get(f"http://{ip}:{port}/model/info", timeout=aiohttp.ClientTimeout(total=3.0, connect=1.5)) as r:
+                          if r.status == 200:
+                              data = await r.json()
+                              models = list(data.get("data", {}).keys()) or list(data.keys())
+                              if models:
+                                  return {"host": target, "ip": ip, "port": port, "type": "litellm_router", "models": models, "endpoint_path": "/model/info"}
+                  except:
+                      pass
+
+              # 3. Multi-Path Probe for OpenAI/OneAPI/NewAPI/FastGPT/vLLM/SGLang
+              candidate_paths = ["/v1/models", "/api/v1/models", "/openai/v1/models"]
+              for path in candidate_paths:
+                  url = f"http://{ip}:{port}{path}"
+                  try:
+                      async with session.get(url, timeout=aiohttp.ClientTimeout(total=3.0, connect=1.5)) as r:
+                          if r.status == 200:
+                              data = await r.json()
+                              raw_m = data.get("data") or data.get("models") or []
+                              models = []
+                              is_sglang = False
+                              for m in raw_m:
+                                  if isinstance(m, dict):
+                                      mid = m.get("id") or m.get("name")
+                                      if mid:
+                                          models.append(mid)
+                                      if m.get("owned_by") == "sglang":
+                                          is_sglang = True
+                                  elif isinstance(m, str):
+                                      models.append(m)
+                              if models:
+                                  htype = "sglang_native" if is_sglang else "openai_compatible"
+                                  return {"host": target, "ip": ip, "port": port, "type": htype, "models": models, "endpoint_path": path}
+                  except:
+                      pass
               return None
 
-          async def run_prompt_test(session, host, port, m_name, p_label, p_text):
+          async def run_prompt_test(session, host, port, m_name, p_label, p_text, ep_path):
               is_ollama = (port == 11434)
-              url = f"http://{host}/api/generate" if is_ollama else f"http://{host}/v1/chat/completions"
-              try:
-                  if is_ollama:
-                      payload = {"model": m_name, "prompt": p_text, "stream": False}
-                  else:
-                      payload = {"model": m_name, "messages": [{"role": "user", "content": p_text}], "max_tokens": 120, "temperature": 0.1}
+              if is_ollama:
+                  url = f"http://{host}/api/generate"
+                  payload = {"model": m_name, "prompt": p_text, "stream": False}
+              elif ep_path == "/openai/v1/models":
+                  url = f"http://{host}/openai/v1/chat/completions"
+                  payload = {"model": m_name, "messages": [{"role": "user", "content": p_text}], "max_tokens": 120, "temperature": 0.1}
+              elif ep_path == "/api/v1/models":
+                  url = f"http://{host}/api/v1/chat/completions"
+                  payload = {"model": m_name, "messages": [{"role": "user", "content": p_text}], "max_tokens": 120, "temperature": 0.1}
+              else:
+                  url = f"http://{host}/v1/chat/completions"
+                  payload = {"model": m_name, "messages": [{"role": "user", "content": p_text}], "max_tokens": 120, "temperature": 0.1}
                   
+              try:
                   async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=4.5, connect=2.0)) as r:
                       if r.status == 200:
                           data = await r.json()
@@ -155,14 +175,14 @@ jobs:
               host = entry["host"]
               port = entry["port"]
               models = entry["models"]
+              ep_path = entry.get("endpoint_path", "/v1/models")
               
               working = []
-              # Audit models (up to 30 models per host)
-              for m in models[:30]:
+              for m in models[:40]: # Test up to 40 models per dense router
                   m_name = m.get("name") if isinstance(m, dict) else str(m)
                   passed = 0
                   for p_label, p_text in PROMPTS:
-                      if await run_prompt_test(session, host, port, m_name, p_label, p_text):
+                      if await run_prompt_test(session, host, port, m_name, p_label, p_text, ep_path):
                           passed += 1
                       elif passed == 0:
                           break
@@ -186,6 +206,7 @@ jobs:
                   "ip": entry["ip"],
                   "port": port,
                   "type": entry["type"],
+                  "endpoint_path": ep_path,
                   "total_models": len(models),
                   "working_models_count": len(working),
                   "working_models": working,
@@ -195,13 +216,11 @@ jobs:
           async def main_pipeline():
               connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300)
               async with aiohttp.ClientSession(connector=connector) as session:
-                  # Step 1: Rapid Probing (150 concurrent workers)
-                  print("⚡ Stage 1: Async In-Runner Probing...")
+                  print("⚡ Stage 1: Async In-Runner Multi-Path Probing (/v1/models, /api/v1/models, /model/info)...")
                   tasks = [probe_target(session, t) for t in target_set]
                   discovered = [res for res in await asyncio.gather(*tasks) if res]
                   print(f"✨ Found {len(discovered)} model-bearing hosts.")
 
-                  # Step 2: 4-Prompt Validation
                   print("🧪 Stage 2: Deep 4-Prompt Validation on Runner...")
                   val_tasks = [validate_host(session, h) for h in discovered]
                   validated = await asyncio.gather(*val_tasks)
