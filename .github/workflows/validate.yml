@@ -1,4 +1,4 @@
-name: 4-Prompt Ollama Host Validator
+name: v2 Hardened Host Validator
 
 on:
   workflow_dispatch:
@@ -6,10 +6,18 @@ on:
       hosts:
         description: 'Comma-separated host:port list to validate'
         required: true
-      model:
-        description: 'Model name to validate on each host'
+      models:
+        description: 'Max models to test per host'
         required: true
-        default: 'kimi-k2.6:cloud'
+        default: '3'
+      workers:
+        description: 'Concurrent host workers'
+        required: true
+        default: '8'
+      timeout:
+        description: 'Per-request timeout seconds'
+        required: true
+        default: '12'
 
 jobs:
   validate:
@@ -18,14 +26,25 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Run 4-prompt validation
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install aiohttp
+
+      - name: Run v2 hardened validation
         run: |
-          python3 validate_hosts.py \
+          python3 validate_v2.py \
             --hosts "${{ github.event.inputs.hosts }}" \
-            --model "${{ github.event.inputs.model }}"
+            --models "${{ github.event.inputs.models }}" \
+            --workers "${{ github.event.inputs.workers }}" \
+            --timeout "${{ github.event.inputs.timeout }}" \
+            -o validate_v2_results.json
 
       - name: Upload validation results
         uses: actions/upload-artifact@v4
         with:
-          name: validation-results-${{ github.run_id }}
-          path: validation_results.json
+          name: validation-v2-${{ github.run_id }}
+          path: validate_v2_results.json

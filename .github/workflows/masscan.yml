@@ -235,11 +235,35 @@ jobs:
           asyncio.run(main_pipeline())
           EOF
 
+      - name: Stage 3 — v2 Hardening Pass (replay/alias/streaming forensics on GOLD+SILVER)
+        run: |
+          python3 - << 'EOF'
+          import json, subprocess, sys
+          try:
+              data = json.load(open("validated_compute.json"))
+          except Exception:
+              sys.exit(0)
+          candidates = [v["host"] for v in data if v.get("tier") in ("GOLD", "SILVER")]
+          if not candidates:
+              print("No GOLD/SILVER candidates — skipping v2 pass.")
+              sys.exit(0)
+          print(f"🔬 v2 hardening pass on {len(candidates)} GOLD/SILVER hosts...")
+          r = subprocess.run([sys.executable, "validate_v2.py",
+                              "--hosts", ",".join(candidates),
+                              "--models", "3", "--workers", "8", "--timeout", "12",
+                              "-o", "validated_compute_v2.json"],
+                             capture_output=True, text=True)
+          print(r.stdout[-3000:])
+          if r.returncode != 0:
+              print("v2 pass errored (non-fatal):", r.stderr[-500:])
+          EOF
+
       - name: Upload Validated Compute Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: batch-validated-compute-${{ github.run_id }}
           path: |
             validated_compute.json
+            validated_compute_v2.json
             non_llm_infra.json
             hits.json
