@@ -7,13 +7,13 @@ on:
         description: 'Comma-separated host:port list to validate'
         required: true
       models:
-        description: 'Max models to test per host'
+        description: 'Max models to test per host (0 = ALL)'
         required: true
-        default: '3'
+        default: '0'
       workers:
         description: 'Concurrent host workers'
         required: true
-        default: '8'
+        default: '12'
       timeout:
         description: 'Per-request timeout seconds'
         required: true
