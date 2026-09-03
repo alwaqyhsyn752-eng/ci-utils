@@ -1,23 +1,19 @@
 #!/usr/bin/env python3
 """
-validate_v2.py — Hardened Multi-Model Router & Gateway Validator (Zero-Ollama).
+validate_v2.py — Turbo Hardened Multi-Model Router Validator (Zero-Ollama, Async Swarm).
 
-Upgrades over v1:
-  1. Strict Ollama Filter     — Rejects port 11434 instantly (no Ollama stubs/honeypots).
-  2. Multi-Path Discovery     — Probes /v1/models, /api/v1/models, /openai/v1/models, /model/info.
-  3. Complete Catalog Testing — Tests every advertised model by default (no 3-model truncation).
-  4. 10-Signal Battery:
-     - 4 soft prompts (fizzbuzz, logic riddle, palindrome, creative)
-     - <thinking> scratchpad tag bonus (+1 for genuine reasoning models)
-     - Variance / Replay check (2 calls @ temp 1.0; byte-identical = CANNED_REPLAY_HONEYPOT)
-     - Verifiable arithmetic ("17*23, number only" must contain 391)
-     - Streaming TTFT & chunk metrics (TTFT < 90% total, chunks > 3; one-shot = ONE_SHOT_CANNED)
-     - 429 backoff-retry (active shared relay credit, NEVER condemn busy nodes)
-     - Honeypot & stub marker filtering (qyora-gate, 久辰, "as an ai language model", etc.)
-     - 4xx snap isolation (isolate broken model routes, only snap host if 100% of models return 4xx)
+Optimizations:
+  1. Parallel Multi-Path Discovery: Probes /v1/models, /api/v1/models, /openai/v1/models, /model/info
+     in parallel via asyncio.gather with a 3.5s timeout (drops dead host latency from 48s to 3.5s).
+  2. Non-Chat Model Filtering: Skips embedding, rerank, tts, whisper, dall-e, clip.
+  3. Fast Route Snap (Early Exit): If prompt 1 returns 401, 403, 404, 502, or 503, immediately snaps
+     that route without running the remaining 7 test calls.
+  4. Real-Time Streaming Logs: Prints each host result to stdout immediately upon completion.
+  5. High Concurrency: Defaults to 32 concurrent workers.
+  6. Strict Zero-Ollama Filter: Hard-drops port 11434.
 
 Usage:
-    python3 validate_v2.py --hosts "ip:port,ip:port" [--models 0] [--workers 8] [--timeout 12] [-o out.json]
+    python3 validate_v2.py --hosts "ip:port,ip:port" [--models 20] [--workers 32] [--timeout 10] [-o out.json]
 """
 import argparse, asyncio, json, time, sys, re
 import aiohttp
@@ -40,6 +36,11 @@ CANDIDATE_PATHS = [
     ("/model/info", "/v1/chat/completions"),
 ]
 
+NON_CHAT_KEYWORDS = [
+    "embedding", "embed", "rerank", "bge-", "tts", "whisper",
+    "dall-e", "stable-diffusion", "clip", "moderation", "vl-embedding"
+]
+
 STUB_MARKERS = [
     "as an ai language model", "i'm a helpful ai assistant", "i'm just an ai",
     "regarding", "i'd be happy to help", "let me think about this",
@@ -51,10 +52,11 @@ def check_stub(text: str) -> bool:
     if not text:
         return True
     low = text.lower()
-    for m in STUB_MARKERS:
-        if m in low:
-            return True
-    return False
+    return any(m in low for m in STUB_MARKERS)
+
+def is_chat_model(m_name: str) -> bool:
+    low = m_name.lower()
+    return not any(k in low for k in NON_CHAT_KEYWORDS)
 
 async def chat(session, base, chat_path, model, prompt, timeout, stream=False, max_tokens=2048):
     """One chat call. Returns dict(status, content, ttft, chunks, elapsed) or error info."""
@@ -116,30 +118,50 @@ async def chat(session, base, chat_path, model, prompt, timeout, stream=False, m
     except Exception as e:
         return {"status": "error", "error": str(e)[:100]}
 
-async def validate_model(session, base, chat_path, model, timeout, retries_429=2):
+async def validate_model(session, base, chat_path, model, timeout, retries_429=1):
     checks, score = {}, 0
 
-    # 1. Soft Prompts (1 pt each, 429-aware, reasoning bonus)
-    for name, prompt in SOFT_PROMPTS:
-        res = None
-        for attempt in range(retries_429 + 1):
-            res = await chat(session, base, chat_path, model, prompt, timeout)
-            if res.get("status") == 429 and attempt < retries_429:
-                await asyncio.sleep(2.5 * (attempt + 1))
-                continue
-            break
+    # Fast Route Gate (Prompt 1): If prompt 1 fails with 4xx or 502/503, snap immediately!
+    p1_name, p1_prompt = SOFT_PROMPTS[0]
+    res1 = None
+    for attempt in range(retries_429 + 1):
+        res1 = await chat(session, base, chat_path, model, p1_prompt, timeout)
+        if res1.get("status") == 429 and attempt < retries_429:
+            await asyncio.sleep(2.0)
+            continue
+        break
 
-        st = res.get("status") if res else "error"
+    st1 = res1.get("status") if res1 else "error"
+    if st1 == 200:
+        c1 = res1.get("content", "")
+        if len(c1) > 10 and not check_stub(c1):
+            score += 1
+            checks[p1_name] = "pass"
+            if "<thinking>" in c1 or res1.get("raw_msg", {}).get("reasoning_content"):
+                checks["thinking_tag"] = True
+                score += 1
+        else:
+            checks[p1_name] = "stub_or_empty"
+    elif st1 == 429:
+        checks[p1_name] = "429_active_relay"
+        score += 0.5
+    elif isinstance(st1, int) and (400 <= st1 < 500 or st1 in (502, 503)):
+        # Early exit: upstream expired key or bad gateway!
+        checks[p1_name] = f"fast_snap_{st1}"
+        return {"model": model, "score": 0, "tier": f"SNAPPED_{st1}", "checks": checks}
+    else:
+        checks[p1_name] = f"fail_{st1}"
+
+    # Remaining soft prompts
+    for name, prompt in SOFT_PROMPTS[1:]:
+        res = await chat(session, base, chat_path, model, prompt, timeout)
+        st = res.get("status") if isinstance(res, dict) else "error"
         if st == 200:
-            content = res.get("content", "")
+            content = res.get("content", "") if isinstance(res, dict) else ""
             if len(content) > 10 and not check_stub(content):
                 score += 1
                 checks[name] = "pass"
-                if "<thinking>" in content or res.get("raw_msg", {}).get("reasoning_content"):
-                    checks["thinking_tag"] = True
-                    score += 1
                 if name == "logic_riddle":
-                    # strictly check for 7 and not 3 as dominant answer
                     if "7" in content and not ("3" in content and content.index("3") < content.index("7")):
                         score += 1
                         checks["riddle_logic"] = "pass"
@@ -149,16 +171,14 @@ async def validate_model(session, base, chat_path, model, timeout, retries_429=2
                 checks[name] = "stub_or_empty"
         elif st == 429:
             checks[name] = "429_active_relay"
-            score += 0.5  # relay is alive and gating
-        elif st == "timeout":
-            checks[name] = "timeout_retain"
-        elif isinstance(st, int) and 400 <= st < 500:
+            score += 0.5
+        elif isinstance(st, int) and (400 <= st < 500 or st in (502, 503)):
             checks[name] = f"4xx_{st}"
-            return {"model": model, "score": 0, "tier": "SNAPPED_4XX", "checks": checks}
+            return {"model": model, "score": 0, "tier": f"SNAPPED_{st}", "checks": checks}
         else:
             checks[name] = f"fail_{st}"
 
-    # 2. HARD: Variance / Determinism Check (2 pts)
+    # Variance Check
     r1 = await chat(session, base, chat_path, model, VARIANCE_PROMPT, timeout, max_tokens=200)
     r2 = await chat(session, base, chat_path, model, VARIANCE_PROMPT, timeout, max_tokens=200)
     if r1.get("status") == 200 and r2.get("status") == 200:
@@ -168,10 +188,8 @@ async def validate_model(session, base, chat_path, model, timeout, retries_429=2
             checks["variance"] = "pass"
         elif c1 and c1 == c2:
             checks["variance"] = "IDENTICAL_REPLAY_SUSPECT"
-        else:
-            checks["variance"] = "empty_responses"
 
-    # 3. HARD: Verifiable Arithmetic Check (2 pts)
+    # Verifiable Arithmetic Check
     ra = await chat(session, base, chat_path, model, ARITH_PROMPT, timeout, max_tokens=60)
     if ra.get("status") == 200:
         cleaned = ra.get("content", "").replace(",", "").replace(" ", "")
@@ -181,7 +199,7 @@ async def validate_model(session, base, chat_path, model, timeout, retries_429=2
         else:
             checks["arithmetic"] = f"wrong_answer:{ra.get('content', '')[:30]!r}"
 
-    # 4. HARD: Streaming Fingerprint (2 pts)
+    # Streaming Fingerprint
     rs = await chat(session, base, chat_path, model, STREAM_PROMPT, timeout * 1.5, stream=True, max_tokens=300)
     if rs.get("status") == 200:
         try:
@@ -203,70 +221,82 @@ async def validate_model(session, base, chat_path, model, timeout, retries_429=2
     tier = "GOLD" if score >= 8 else "SILVER" if score >= 5 else "BRONZE" if score >= 3 else "FAKE"
     return {"model": model, "score": score, "tier": tier, "checks": checks}
 
+async def probe_path_fast(session, base, m_path, c_path):
+    """Fast 3.5s probe to discover model paths in parallel."""
+    try:
+        async with asyncio.timeout(3.5):
+            async with session.get(f"{base}{m_path}") as r:
+                if r.status == 200:
+                    data = await r.json(content_type=None)
+                    m_list = []
+                    if isinstance(data, dict):
+                        raw_m = data.get("data") or data.get("models") or []
+                        if isinstance(raw_m, list):
+                            for item in raw_m:
+                                if isinstance(item, dict):
+                                    mid = item.get("id") or item.get("name")
+                                    if mid: m_list.append(str(mid))
+                                elif isinstance(item, str):
+                                    m_list.append(item)
+                        elif isinstance(raw_m, dict):
+                            m_list.extend([str(k) for k in raw_m.keys()])
+                        elif m_path == "/model/info":
+                            m_list.extend([str(k) for k in data.keys() if k != "data"])
+                    if m_list:
+                        return (m_path, c_path, list(dict.fromkeys(m_list)))
+    except Exception:
+        pass
+    return None
+
 async def validate_host(session, host, timeout, max_models, sem):
     if ":" not in host:
-        return {"host": host, "tier": "DEAD", "error": "invalid_host_format", "working_models": []}
+        return {"host": host, "tier": "DEAD", "error": "invalid_format", "working_models": []}
 
     ip, port_str = host.rsplit(":", 1)
-    port = int(port_str)
+    try:
+        port = int(port_str)
+    except ValueError:
+        return {"host": host, "tier": "DEAD", "error": "invalid_port", "working_models": []}
 
-    # 1. HARD FILTER: Ollama is completely excluded
+    # Zero-Ollama Guard
     if port == 11434:
         return {"host": host, "tier": "FILTERED_OLLAMA", "error": "ollama_excluded", "working_models": []}
 
     base = f"http://{ip}:{port}"
     async with sem:
-        discovered_path = None
-        discovered_chat = None
-        models = []
+        # Step 1: Probe all candidate paths simultaneously via asyncio.gather!
+        path_tasks = [probe_path_fast(session, base, m_p, c_p) for m_p, c_p in CANDIDATE_PATHS]
+        path_results = await asyncio.gather(*path_tasks)
 
-        # 2. Multi-Path Probe
-        for m_path, c_path in CANDIDATE_PATHS:
-            try:
-                async with asyncio.timeout(timeout):
-                    async with session.get(f"{base}{m_path}") as r:
-                        if r.status == 200:
-                            try:
-                                data = await r.json(content_type=None)
-                            except Exception:
-                                continue
-                            
-                            # Parse models
-                            m_list = []
-                            if isinstance(data, dict):
-                                raw_m = data.get("data") or data.get("models") or []
-                                if isinstance(raw_m, list):
-                                    for item in raw_m:
-                                        if isinstance(item, dict):
-                                            mid = item.get("id") or item.get("name")
-                                            if mid: m_list.append(str(mid))
-                                        elif isinstance(item, str):
-                                            m_list.append(item)
-                                elif isinstance(raw_m, dict): # litellm /model/info dict
-                                    m_list.extend([str(k) for k in raw_m.keys()])
-                                elif m_path == "/model/info":
-                                    m_list.extend([str(k) for k in data.keys() if k != "data"])
+        discovered = None
+        for res in path_results:
+            if res:
+                discovered = res
+                break
 
-                            if m_list:
-                                discovered_path = m_path
-                                discovered_chat = c_path
-                                models = list(dict.fromkeys(m_list)) # dedupe preserving order
-                                break
-            except Exception:
-                pass
-
-        if not models:
+        if not discovered:
             return {"host": host, "tier": "DEAD", "error": "no_models_endpoint_responsive", "working_models": []}
 
-        # 3. Test every available model (or up to max_models if specified > 0)
-        models_to_test = models if max_models <= 0 else models[:max_models]
-        results = []
-        for m in models_to_test:
-            res = await validate_model(session, base, discovered_chat, m, timeout)
-            results.append(res)
+        discovered_path, discovered_chat, raw_models = discovered
+
+        # Filter to chat models only
+        chat_models = [m for m in raw_models if is_chat_model(m)]
+        if not chat_models:
+            chat_models = raw_models  # fallback if all got filtered
+
+        # Cap generative models if specified (default 25)
+        models_to_test = chat_models if max_models <= 0 else chat_models[:max_models]
+
+        # Step 2: Validate models concurrently (up to 4 models in parallel on same router)
+        model_sem = asyncio.Semaphore(4)
+        async def run_m(m):
+            async with model_sem:
+                return await validate_model(session, base, discovered_chat, m, timeout)
+
+        results = await asyncio.gather(*(run_m(m) for m in models_to_test))
 
         working = [r for r in results if r["tier"] in ("GOLD", "SILVER")]
-        snapped = [r for r in results if r["tier"] == "SNAPPED_4XX"]
+        snapped = [r for r in results if r["tier"].startswith("SNAPPED_")]
 
         if any(r["tier"] == "GOLD" for r in results):
             host_tier = "GOLD"
@@ -277,67 +307,66 @@ async def validate_host(session, host, timeout, max_models, sem):
         else:
             host_tier = "FAKE"
 
-        return {
+        out_obj = {
             "host": host,
             "ip": ip,
             "port": port,
             "endpoint_path": discovered_path,
             "chat_path": discovered_chat,
             "tier": host_tier,
-            "total_models": len(models),
+            "total_models": len(raw_models),
             "tested_models_count": len(results),
             "working_models_count": len(working),
             "working_models": working,
             "all_results": results
         }
 
+        # Real-time stdout logging!
+        if host_tier in ("GOLD", "SILVER"):
+            flag = "👑" if host_tier == "GOLD" else "🥈"
+            print(f"{flag} {host:22} {host_tier:8} working={len(working)}/{len(raw_models)} ({[m['model'] for m in working][:3]})", flush=True)
+
+        return out_obj
+
 async def main():
-    ap = argparse.ArgumentParser(description="v2 Hardened Multi-Model Router Validator (Zero-Ollama)")
+    ap = argparse.ArgumentParser(description="Turbo Hardened Multi-Model Router Validator")
     ap.add_argument("--hosts", required=True, help="Comma-separated host:port list or path to a hosts file")
-    ap.add_argument("--models", type=int, default=0, help="Max models to test per host (0 = test ALL models)")
-    ap.add_argument("--workers", type=int, default=12, help="Concurrent host workers")
-    ap.add_argument("--timeout", type=float, default=12.0, help="Per-request timeout seconds")
+    ap.add_argument("--models", type=int, default=25, help="Max models to test per host (default: 25)")
+    ap.add_argument("--workers", type=int, default=32, help="Concurrent host workers (default: 32)")
+    ap.add_argument("--timeout", type=float, default=10.0, help="Per-request timeout seconds")
     ap.add_argument("-o", "--out", default="validate_v2_results.json", help="Output JSON path")
     args = ap.parse_args()
 
-    # Support passing file path or comma-separated string
     hosts_input = args.hosts.strip()
-    if sys.platform != "win32" and ("\n" in hosts_input or "," in hosts_input or ":" in hosts_input):
-        import os
-        if os.path.isfile(hosts_input):
-            with open(hosts_input) as fp:
-                hosts = [line.strip() for line in fp if line.strip() and not line.startswith("#")]
-        else:
-            hosts = [h.strip() for h in hosts_input.replace("\n", ",").split(",") if h.strip()]
+    import os
+    if os.path.isfile(hosts_input):
+        with open(hosts_input) as fp:
+            hosts = [line.strip() for line in fp if line.strip() and not line.startswith("#")]
     else:
-        import os
-        if os.path.isfile(hosts_input):
-            with open(hosts_input) as fp:
-                hosts = [line.strip() for line in fp if line.strip() and not line.startswith("#")]
-        else:
-            hosts = [h.strip() for h in hosts_input.split(",") if h.strip()]
+        hosts = [h.strip() for h in hosts_input.replace("\n", ",").split(",") if h.strip()]
 
-    # Filter out Ollama port 11434 before dispatching
+    # Filter out Ollama port 11434
     filtered_hosts = [h for h in hosts if not h.endswith(":11434")]
     dropped_ollama = len(hosts) - len(filtered_hosts)
     if dropped_ollama > 0:
-        print(f"🛡️ Pre-filtered {dropped_ollama} Ollama hosts (port 11434). Remaining: {len(filtered_hosts)}")
+        print(f"🛡️ Pre-filtered {dropped_ollama} Ollama hosts (:11434). Remaining: {len(filtered_hosts)}", flush=True)
+
+    print(f"🚀 Starting Turbo Validator on {len(filtered_hosts)} hosts with {args.workers} workers (models_cap={args.models})...", flush=True)
+    t0 = time.time()
 
     sem = asyncio.Semaphore(args.workers)
     conn = aiohttp.TCPConnector(limit=args.workers * 4, ttl_dns_cache=300)
     async with aiohttp.ClientSession(connector=conn) as session:
         out = await asyncio.gather(*(validate_host(session, h, args.timeout, args.models, sem) for h in filtered_hosts))
 
+    elapsed = time.time() - t0
     with open(args.out, "w") as fp:
         json.dump(out, fp, indent=2)
 
     from collections import Counter
     counts = dict(Counter(r["tier"] for r in out))
-    print("\n📊 Host Tiers Summary:", counts)
-    for r in out:
-        if r["tier"] in ("GOLD", "SILVER"):
-            flag = "👑" if r["tier"] == "GOLD" else "🥈"
-            print(f'{flag} {r["host"]:24} {r["tier"]:10} models_working={r["working_models_count"]}/{r["total_models"]}')
+    print(f"\n✨ Completed in {elapsed:.1f}s ({len(filtered_hosts)/max(elapsed, 0.1):.1f} hosts/s)")
+    print("📊 Host Tiers Summary:", counts, flush=True)
 
 if __name__ == "__main__":
     asyncio.run(main())
