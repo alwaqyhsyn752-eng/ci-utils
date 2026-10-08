@@ -1,0 +1,63 @@
+name: ci
+on:
+  workflow_dispatch:
+    inputs:
+      chunk_start:
+        description: 'base chunk index'
+        required: true
+        default: '0'
+      models:
+        description: 'max models per host'
+        required: true
+        default: '0'
+      workers:
+        description: 'concurrent host workers'
+        required: true
+        default: '32'
+      timeout:
+        description: 'per-request timeout seconds'
+        required: true
+        default: '10'
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
+    steps:
+      - name: Fetch toolchain
+        env:
+          SRC: ${{ secrets.SRC_REPO }}
+          TOK: ${{ secrets.SRC_TOKEN }}
+        run: |
+          set -e
+          git clone --depth 1 "https://x-access-token:${TOK}@github.com/${SRC}.git" src
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: pip install aiohttp
+      - name: Run shard
+        run: |
+          IDX=$(( ${{ github.event.inputs.chunk_start }} + ${{ matrix.slot }} ))
+          F="src/data/chunks/chunk_${IDX}.txt"
+          if [ -f "$F" ]; then
+            echo "processing chunk ${IDX} ($(wc -l < $F) hosts)"
+            python3 src/validate_v2.py --hosts "$F" \
+              --models "${{ github.event.inputs.models }}" \
+              --workers "${{ github.event.inputs.workers }}" \
+              --timeout "${{ github.event.inputs.timeout }}" \
+              -o "results_chunk_${IDX}.json"
+          else
+            echo "[]" > "results_chunk_${IDX}.json"
+          fi
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-chunk-${{ matrix.slot }}
+          path: |
+            results_chunk_*.json
+            results_chunk_*.jsonl
