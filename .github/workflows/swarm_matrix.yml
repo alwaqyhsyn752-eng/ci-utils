@@ -58,7 +58,10 @@ jobs:
           fi
 
       - name: Upload Shard Results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: results-chunk-${{ matrix.slot }}
-          path: results_chunk_*.json
+          path: |
+            results_chunk_*.json
+            results_chunk_*.jsonl

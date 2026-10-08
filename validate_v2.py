@@ -5,17 +5,23 @@ validate_v2.py — Turbo Hardened Multi-Model Router Validator (Zero-Ollama, Asy
 Optimizations:
   1. Parallel Multi-Path Discovery: Probes /v1/models, /api/v1/models, /openai/v1/models, /model/info
      in parallel via asyncio.gather with a 3.5s timeout (drops dead host latency from 48s to 3.5s).
-  2. Non-Chat Model Filtering: Skips embedding, rerank, tts, whisper, dall-e, clip.
+  2. Non-Chat Model Filtering: Skips embedding, rerank, tts, whisper, dall-e, clip, flux, cogview, sora, midjourney.
   3. Fast Route Snap (Early Exit): If prompt 1 returns 401, 403, 404, 502, or 503, immediately snaps
      that route without running the remaining 7 test calls.
-  4. Real-Time Streaming Logs: Prints each host result to stdout immediately upon completion.
-  5. High Concurrency: Defaults to 32 concurrent workers.
-  6. Strict Zero-Ollama Filter: Hard-drops port 11434.
+  4. Consecutive-Timeout Abort: If prompts 1 AND 2 both time out, skips remaining checks entirely.
+  5. Streaming Hardening: TTFT ceiling (4s), chunk counts only on real content, [DONE] break,
+     partial results preserved on timeout, early exit at 5 chunks.
+  6. Host-Level Total Budget: 90s cap per host — partial results saved on budget exhaustion.
+  7. Incremental JSONL Ledger: Each completed host appended to .jsonl immediately.
+  8. Arithmetic Boundary Check: Word-boundary regex on 391 (no false positives from timestamps/IDs).
+  9. Real-Time Streaming Logs: Prints each host result to stdout immediately upon completion.
+ 10. High Concurrency: Defaults to 32 concurrent workers.
+ 11. Strict Zero-Ollama Filter: Hard-drops port 11434 (unless --include-ollama).
 
 Usage:
     python3 validate_v2.py --hosts "ip:port,ip:port" [--models 20] [--workers 32] [--timeout 10] [-o out.json]
 """
-import argparse, asyncio, json, time, sys, re
+import argparse, asyncio, json, time, sys, re, os
 import aiohttp
 
 SOFT_PROMPTS = [
@@ -26,8 +32,12 @@ SOFT_PROMPTS = [
 ]
 VARIANCE_PROMPT = "Write a 1-sentence thought about the ocean at night."
 ARITH_PROMPT = "What is 17*23? Respond with just the number."
-ARITH_ANSWER = "391"
+ARITH_RE = re.compile(r"(?<!\d)391(?!\d)")
 STREAM_PROMPT = "Count from 1 to 30, one number per line."
+TTFT_CEILING = 4.0  # seconds — max time to first real content chunk
+STREAM_EARLY_CHUNKS = 5  # exit streaming once this many content chunks received
+HOST_BUDGET = 90.0  # seconds — max total time per host
+CONNECT_TIMEOUT = 2.0  # seconds — TCP connect timeout per request
 
 CANDIDATE_PATHS = [
     ("/v1/models", "/v1/chat/completions"),
@@ -38,7 +48,8 @@ CANDIDATE_PATHS = [
 
 NON_CHAT_KEYWORDS = [
     "embedding", "embed", "rerank", "bge-", "tts", "whisper",
-    "dall-e", "stable-diffusion", "clip", "moderation", "vl-embedding"
+    "dall-e", "stable-diffusion", "clip", "moderation", "vl-embedding",
+    "flux", "cogview", "sora", "midjourney"
 ]
 
 STUB_MARKERS = [
@@ -58,6 +69,7 @@ def is_chat_model(m_name: str) -> bool:
     low = m_name.lower()
     return not any(k in low for k in NON_CHAT_KEYWORDS)
 
+
 async def chat(session, base, chat_path, model, prompt, timeout, stream=False, max_tokens=2048):
     """One chat call. Returns dict(status, content, ttft, chunks, elapsed) or error info."""
     t0 = time.time()
@@ -68,10 +80,13 @@ async def chat(session, base, chat_path, model, prompt, timeout, stream=False, m
         "stream": stream
     }
     url = f"{base}{chat_path}"
+    # Initialize streaming vars outside try so outer except can check them
+    ttft, chunks, text = None, 0, []
     try:
         async with asyncio.timeout(timeout):
             if not stream:
-                async with session.post(url, json=payload) as r:
+                async with session.post(url, json=payload,
+                                        timeout=aiohttp.ClientTimeout(total=timeout, connect=CONNECT_TIMEOUT)) as r:
                     if r.status != 200:
                         return {"status": r.status}
                     try:
@@ -89,22 +104,62 @@ async def chat(session, base, chat_path, model, prompt, timeout, stream=False, m
 
             # Streaming mode
             ttft, chunks, text = None, 0, []
-            async with session.post(url, json=payload) as r:
-                if r.status != 200:
-                    return {"status": r.status}
-                async for line in r.content:
-                    line = line.strip()
-                    if not line.startswith(b"data:") or line == b"data: [DONE]":
-                        continue
-                    if ttft is None:
-                        ttft = time.time() - t0
-                    chunks += 1
-                    try:
-                        delta = json.loads(line[5:])["choices"][0].get("delta", {})
-                        d_text = delta.get("content") or delta.get("reasoning_content") or ""
+            done = False
+            try:
+                async with session.post(url, json=payload,
+                                        timeout=aiohttp.ClientTimeout(total=timeout, connect=CONNECT_TIMEOUT)) as r:
+                    if r.status != 200:
+                        return {"status": r.status}
+                    async for line in r.content:
+                        line = line.strip()
+                        if not line.startswith(b"data:"):
+                            continue
+                        if line == b"data: [DONE]":
+                            done = True
+                            break
+                        try:
+                            delta = json.loads(line[5:])["choices"][0].get("delta", {})
+                            d_text = delta.get("content") or delta.get("reasoning_content") or ""
+                        except Exception:
+                            continue
+                        if not d_text:
+                            continue
+                        # Only count chunks and set ttft on real content
+                        if ttft is None:
+                            ttft = time.time() - t0
+                            if ttft > TTFT_CEILING:
+                                break  # TTFT exceeded — snap
+                        chunks += 1
                         text.append(d_text)
-                    except Exception:
-                        pass
+                        if chunks >= STREAM_EARLY_CHUNKS:
+                            done = True
+                            break
+            except (asyncio.TimeoutError, TimeoutError):
+                # Partial results on timeout — preserve what we got
+                elapsed = time.time() - t0
+                if chunks > 0:
+                    return {
+                        "status": 200,
+                        "content": "".join(text).strip(),
+                        "ttft": ttft,
+                        "chunks": chunks,
+                        "elapsed": elapsed,
+                        "partial": True
+                    }
+                return {"status": "timeout"}
+            except Exception:
+                # Stream-level error — preserve partial results
+                elapsed = time.time() - t0
+                if chunks > 0:
+                    return {
+                        "status": 200,
+                        "content": "".join(text).strip(),
+                        "ttft": ttft,
+                        "chunks": chunks,
+                        "elapsed": elapsed,
+                        "partial": True
+                    }
+                return {"status": "error"}
             elapsed = time.time() - t0
             return {
                 "status": 200,
@@ -114,9 +169,30 @@ async def chat(session, base, chat_path, model, prompt, timeout, stream=False, m
                 "elapsed": elapsed
             }
     except asyncio.TimeoutError:
+        # Outer timeout fired — check if streaming collected partial results
+        if stream and chunks > 0:
+            return {
+                "status": 200,
+                "content": "".join(text).strip(),
+                "ttft": ttft,
+                "chunks": chunks,
+                "elapsed": time.time() - t0,
+                "partial": True
+            }
         return {"status": "timeout"}
     except Exception as e:
+        # Outer exception — preserve partial streaming results
+        if stream and chunks > 0:
+            return {
+                "status": 200,
+                "content": "".join(text).strip(),
+                "ttft": ttft,
+                "chunks": chunks,
+                "elapsed": time.time() - t0,
+                "partial": True
+            }
         return {"status": "error", "error": str(e)[:100]}
+
 
 async def validate_model(session, base, chat_path, model, timeout, retries_429=1):
     checks, score = {}, 0
@@ -151,6 +227,18 @@ async def validate_model(session, base, chat_path, model, timeout, retries_429=1
         return {"model": model, "score": 0, "tier": f"SNAPPED_{st1}", "checks": checks}
     else:
         checks[p1_name] = f"fail_{st1}"
+
+    # Consecutive-timeout abort: if prompt 1 timed out, try prompt 2.
+    # If prompt 2 ALSO times out, snap — this is a tarpit, not slow-but-alive.
+    if st1 == "timeout":
+        p2_name, p2_prompt = SOFT_PROMPTS[1]
+        res2 = await chat(session, base, chat_path, model, p2_prompt, timeout)
+        st2 = res2.get("status") if res2 else "error"
+        if st2 == "timeout":
+            checks["early_abort"] = "consecutive_timeouts"
+            return {"model": model, "score": 0, "tier": "TARPIT_TIMEOUT", "checks": checks}
+        # Prompt 2 responded — process it through the normal loop below
+        # (it will be re-tested as part of the remaining soft prompts)
 
     # Remaining soft prompts
     for name, prompt in SOFT_PROMPTS[1:]:
@@ -189,17 +277,17 @@ async def validate_model(session, base, chat_path, model, timeout, retries_429=1
         elif c1 and c1 == c2:
             checks["variance"] = "IDENTICAL_REPLAY_SUSPECT"
 
-    # Verifiable Arithmetic Check
+    # Verifiable Arithmetic Check — word-boundary regex on 391
     ra = await chat(session, base, chat_path, model, ARITH_PROMPT, timeout, max_tokens=60)
     if ra.get("status") == 200:
-        cleaned = ra.get("content", "").replace(",", "").replace(" ", "")
-        if ARITH_ANSWER in cleaned:
+        content = ra.get("content", "")
+        if ARITH_RE.search(content):
             score += 2
             checks["arithmetic"] = "pass"
         else:
-            checks["arithmetic"] = f"wrong_answer:{ra.get('content', '')[:30]!r}"
+            checks["arithmetic"] = f"wrong_answer:{content[:30]!r}"
 
-    # Streaming Fingerprint
+    # Streaming Fingerprint — with TTFT ceiling and chunk-accuracy
     rs = await chat(session, base, chat_path, model, STREAM_PROMPT, timeout * 1.5, stream=True, max_tokens=300)
     if rs.get("status") == 200:
         try:
@@ -211,7 +299,8 @@ async def validate_model(session, base, chat_path, model, timeout, retries_429=1
 
         if chunks > 3 and ttft is not None and ttft < elapsed * 0.95:
             score += 2
-            checks["streaming"] = f"pass(ttft={ttft:.2f}s chunks={chunks})"
+            partial_tag = " (partial)" if rs.get("partial") else ""
+            checks["streaming"] = f"pass(ttft={ttft:.2f}s chunks={chunks}{partial_tag})"
         else:
             checks["streaming"] = f"ONE_SHOT_CANNED_SUSPECT(chunks={chunks})"
     elif rs.get("status") == 429:
@@ -221,11 +310,13 @@ async def validate_model(session, base, chat_path, model, timeout, retries_429=1
     tier = "GOLD" if score >= 8 else "SILVER" if score >= 5 else "BRONZE" if score >= 3 else "FAKE"
     return {"model": model, "score": score, "tier": tier, "checks": checks}
 
+
 async def probe_path_fast(session, base, m_path, c_path):
     """Fast 3.5s probe to discover model paths in parallel."""
     try:
         async with asyncio.timeout(3.5):
-            async with session.get(f"{base}{m_path}") as r:
+            async with session.get(f"{base}{m_path}",
+                                   timeout=aiohttp.ClientTimeout(total=3.5, connect=CONNECT_TIMEOUT)) as r:
                 if r.status == 200:
                     data = await r.json(content_type=None)
                     m_list = []
@@ -248,21 +339,29 @@ async def probe_path_fast(session, base, m_path, c_path):
         pass
     return None
 
-async def validate_host(session, host, timeout, max_models, sem):
+
+async def validate_host(session, host, timeout, max_models, sem, ledger_fp=None, ledger_lock=None):
     if ":" not in host:
-        return {"host": host, "tier": "DEAD", "error": "invalid_format", "working_models": []}
+        result = {"host": host, "tier": "DEAD", "error": "invalid_format", "working_models": []}
+        _ledger_write(ledger_fp, ledger_lock, result)
+        return result
 
     ip, port_str = host.rsplit(":", 1)
     try:
         port = int(port_str)
     except ValueError:
-        return {"host": host, "tier": "DEAD", "error": "invalid_port", "working_models": []}
+        result = {"host": host, "tier": "DEAD", "error": "invalid_port", "working_models": []}
+        _ledger_write(ledger_fp, ledger_lock, result)
+        return result
 
-    # Zero-Ollama Guard
+    # Zero-Ollama Guard (bypass with --include-ollama)
     if port == 11434:
-        return {"host": host, "tier": "FILTERED_OLLAMA", "error": "ollama_excluded", "working_models": []}
+        result = {"host": host, "tier": "FILTERED_OLLAMA", "error": "ollama_excluded", "working_models": []}
+        _ledger_write(ledger_fp, ledger_lock, result)
+        return result
 
     base = f"http://{ip}:{port}"
+    host_t0 = time.time()
     async with sem:
         # Step 1: Probe all candidate paths simultaneously via asyncio.gather!
         path_tasks = [probe_path_fast(session, base, m_p, c_p) for m_p, c_p in CANDIDATE_PATHS]
@@ -275,7 +374,9 @@ async def validate_host(session, host, timeout, max_models, sem):
                 break
 
         if not discovered:
-            return {"host": host, "tier": "DEAD", "error": "no_models_endpoint_responsive", "working_models": []}
+            result = {"host": host, "tier": "DEAD", "error": "no_models_endpoint_responsive", "working_models": []}
+            _ledger_write(ledger_fp, ledger_lock, result)
+            return result
 
         discovered_path, discovered_chat, raw_models = discovered
 
@@ -293,7 +394,20 @@ async def validate_host(session, host, timeout, max_models, sem):
             async with model_sem:
                 return await validate_model(session, base, discovered_chat, m, timeout)
 
-        results = await asyncio.gather(*(run_m(m) for m in models_to_test))
+        # Host-level total budget — collect partial results even on timeout
+        results = []
+        try:
+            async with asyncio.timeout(HOST_BUDGET):
+                async def collect(m):
+                    r = await run_m(m)
+                    results.append(r)
+                    return r
+                await asyncio.gather(*(collect(m) for m in models_to_test))
+        except asyncio.TimeoutError:
+            # Budget exhausted — fill remaining with placeholder
+            for m in models_to_test:
+                if not any(r.get("model") == m for r in results):
+                    results.append({"model": m, "score": 0, "tier": "HOST_BUDGET_EXHAUSTED", "checks": {}})
 
         working = [r for r in results if r["tier"] in ("GOLD", "SILVER")]
         snapped = [r for r in results if r["tier"].startswith("SNAPPED_")]
@@ -318,7 +432,8 @@ async def validate_host(session, host, timeout, max_models, sem):
             "tested_models_count": len(results),
             "working_models_count": len(working),
             "working_models": working,
-            "all_results": results
+            "all_results": results,
+            "elapsed_s": round(time.time() - host_t0, 2)
         }
 
         # Real-time stdout logging!
@@ -326,27 +441,60 @@ async def validate_host(session, host, timeout, max_models, sem):
             flag = "👑" if host_tier == "GOLD" else "🥈"
             print(f"{flag} {host:22} {host_tier:8} working={len(working)}/{len(raw_models)} ({[m['model'] for m in working][:3]})", flush=True)
 
+        _ledger_write(ledger_fp, ledger_lock, out_obj)
         return out_obj
+
+
+def _ledger_write(ledger_fp, ledger_lock, record):
+    """Append one host result to the JSONL ledger immediately (atomic per record)."""
+    if ledger_fp is None:
+        return
+    line = json.dumps(record, ensure_ascii=False) + "\n"
+    if ledger_lock:
+        ledger_lock.acquire()
+    try:
+        ledger_fp.write(line)
+        ledger_fp.flush()
+    finally:
+        if ledger_lock:
+            ledger_lock.release()
+
 
 async def main():
     ap = argparse.ArgumentParser(description="Turbo Hardened Multi-Model Router Validator")
-    ap.add_argument("--hosts", required=True, help="Comma-separated host:port list or path to a hosts file")
-    ap.add_argument("--models", type=int, default=25, help="Max models to test per host (default: 25)")
+    ap.add_argument("--hosts", required=True, help="Comma-separated host:port list, path to hosts file, or path to masscan -oJ JSON")
+    ap.add_argument("--models", type=int, default=25, help="Max models to test per host (0=ALL, default: 25)")
     ap.add_argument("--workers", type=int, default=32, help="Concurrent host workers (default: 32)")
     ap.add_argument("--timeout", type=float, default=10.0, help="Per-request timeout seconds")
+    ap.add_argument("--include-ollama", action="store_true", help="Include port 11434 (default: filtered)")
     ap.add_argument("-o", "--out", default="validate_v2_results.json", help="Output JSON path")
     args = ap.parse_args()
 
     hosts_input = args.hosts.strip()
-    import os
+
+    # Universal loader: masscan -oJ JSON array, line-delimited ip:port, or comma-separated
     if os.path.isfile(hosts_input):
-        with open(hosts_input) as fp:
-            hosts = [line.strip() for line in fp if line.strip() and not line.startswith("#")]
+        raw = open(hosts_input).read().strip()
+        if raw.startswith("["):
+            # masscan -oJ format
+            hits = json.loads(raw)
+            hosts = []
+            for h in hits:
+                ip = h.get("ip", "")
+                for p in h.get("ports", []):
+                    pnum = p.get("port") if isinstance(p, dict) else p
+                    if pnum:
+                        hosts.append(f"{ip}:{pnum}")
+        else:
+            hosts = [line.strip() for line in raw.splitlines() if line.strip() and not line.startswith("#")]
     else:
         hosts = [h.strip() for h in hosts_input.replace("\n", ",").split(",") if h.strip()]
 
-    # Filter out Ollama port 11434
-    filtered_hosts = [h for h in hosts if not h.endswith(":11434")]
+    # Filter out Ollama port 11434 unless --include-ollama
+    if args.include_ollama:
+        filtered_hosts = hosts
+    else:
+        filtered_hosts = [h for h in hosts if not h.endswith(":11434")]
     dropped_ollama = len(hosts) - len(filtered_hosts)
     if dropped_ollama > 0:
         print(f"🛡️ Pre-filtered {dropped_ollama} Ollama hosts (:11434). Remaining: {len(filtered_hosts)}", flush=True)
@@ -354,19 +502,27 @@ async def main():
     print(f"🚀 Starting Turbo Validator on {len(filtered_hosts)} hosts with {args.workers} workers (models_cap={args.models})...", flush=True)
     t0 = time.time()
 
+    # JSONL ledger for incremental results
+    ledger_path = args.out.replace(".json", ".jsonl") if args.out.endswith(".json") else args.out + ".jsonl"
+    ledger_fp = open(ledger_path, "a")
+    import threading
+    ledger_lock = threading.Lock()
+
     sem = asyncio.Semaphore(args.workers)
     conn = aiohttp.TCPConnector(limit=args.workers * 4, ttl_dns_cache=300)
     async with aiohttp.ClientSession(connector=conn) as session:
-        out = await asyncio.gather(*(validate_host(session, h, args.timeout, args.models, sem) for h in filtered_hosts))
+        out = await asyncio.gather(*(validate_host(session, h, args.timeout, args.models, sem, ledger_fp, ledger_lock) for h in filtered_hosts))
 
     elapsed = time.time() - t0
+    ledger_fp.close()
     with open(args.out, "w") as fp:
         json.dump(out, fp, indent=2)
 
     from collections import Counter
     counts = dict(Counter(r["tier"] for r in out))
     print(f"\n✨ Completed in {elapsed:.1f}s ({len(filtered_hosts)/max(elapsed, 0.1):.1f} hosts/s)")
-    print("📊 Host Tiers Summary:", counts, flush=True)
+    print(f"📊 Host Tiers Summary: {counts}", flush=True)
+    print(f"📋 Incremental ledger: {ledger_path}", flush=True)
 
 if __name__ == "__main__":
     asyncio.run(main())

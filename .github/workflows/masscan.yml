@@ -10,7 +10,7 @@ on:
       ports:
         description: 'Ports to scan'
         required: true
-        default: '11434,8000,8080,3000,3001,3002,3003,3004,3005,4000,30000,8081,8082,8088,8089,8090,5000,5001,8001,8002,6333,2375'
+        default: '8000,8080,3000,3001,3002,3003,3004,3005,4000,30000,8081,8082,8088,8089,8090,5000,5001,8001,8002,6333,2375'
       rate:
         description: 'Packet rate (PPS)'
         required: true
@@ -45,225 +45,21 @@ jobs:
             echo "[]" > hits.json
           fi
 
-      - name: In-Runner Multi-Path Probing & 4-Prompt Validation
+      - name: Run v2 Hardened Validation on All Hits
         run: |
-          python3 - << 'EOF'
-          import json, asyncio, aiohttp, time, os
-
-          PROMPTS = [
-              ("fizzbuzz", "Write a short Python function fizzbuzz(n) that returns 'Fizz', 'Buzz', 'FizzBuzz', or str(n). Output code only."),
-              ("logic_riddle", "If I have 10 sheep and all but 7 run away, how many sheep do I have left? Respond with just the single number."),
-              ("code_palindrome", "Write a Python function is_palindrome(s) returning boolean. Output code only."),
-              ("creative_short", "Write a 1-sentence thought about the ocean at night.")
-          ]
-
-          hits = []
-          try:
-              hits = json.load(open("hits.json"))
-          except Exception as e:
-              print(f"Error loading hits.json: {e}")
-
-          target_set = set()
-          non_llm_infra = []
-          for h in hits:
-              ip = h.get("ip")
-              if not ip:
-                  continue
-              for p in h.get("ports", []):
-                  pnum = p.get("port") if isinstance(p, dict) else p
-                  if pnum in (2375, 6333):
-                      non_llm_infra.append({"ip": ip, "port": pnum, "type": "docker" if pnum == 2375 else "qdrant"})
-                  elif pnum:
-                      target_set.add(f"{ip}:{pnum}")
-
-          with open("non_llm_infra.json", "w") as f:
-              json.dump(non_llm_infra, f, indent=2)
-          print(f"📦 Stashed {len(non_llm_infra)} non-LLM infrastructure targets.")
-          print(f"🎯 Total unique LLM targets to probe in-runner: {len(target_set)}")
-
-          async def probe_target(session, target):
-              ip, port_str = target.split(":")
-              port = int(port_str)
-              
-              # 1. Ollama on 11434
-              if port == 11434:
-                  url = f"http://{ip}:{port}/api/tags"
-                  try:
-                      async with session.get(url, timeout=aiohttp.ClientTimeout(total=3.5, connect=1.5)) as r:
-                          if r.status == 200:
-                              data = await r.json()
-                              models = [m.get("name") for m in data.get("models", []) if isinstance(m, dict) and m.get("name")]
-                              if models:
-                                  return {"host": target, "ip": ip, "port": port, "type": "ollama", "models": models, "endpoint_path": "/api/tags"}
-                  except:
-                      pass
-                  return None
-
-              # 2. LiteLLM /model/info (Specialized LiteLLM Router Probe)
-              if port == 4000:
-                  try:
-                      async with session.get(f"http://{ip}:{port}/model/info", timeout=aiohttp.ClientTimeout(total=3.0, connect=1.5)) as r:
-                          if r.status == 200:
-                              data = await r.json()
-                              models = list(data.get("data", {}).keys()) or list(data.keys())
-                              if models:
-                                  return {"host": target, "ip": ip, "port": port, "type": "litellm_router", "models": models, "endpoint_path": "/model/info"}
-                  except:
-                      pass
-
-              # 3. Multi-Path Probe for OpenAI/OneAPI/NewAPI/FastGPT/vLLM/SGLang
-              candidate_paths = ["/v1/models", "/api/v1/models", "/openai/v1/models"]
-              for path in candidate_paths:
-                  url = f"http://{ip}:{port}{path}"
-                  try:
-                      async with session.get(url, timeout=aiohttp.ClientTimeout(total=3.0, connect=1.5)) as r:
-                          if r.status == 200:
-                              data = await r.json()
-                              raw_m = data.get("data") or data.get("models") or []
-                              models = []
-                              is_sglang = False
-                              for m in raw_m:
-                                  if isinstance(m, dict):
-                                      mid = m.get("id") or m.get("name")
-                                      if mid:
-                                          models.append(mid)
-                                      if m.get("owned_by") == "sglang":
-                                          is_sglang = True
-                                  elif isinstance(m, str):
-                                      models.append(m)
-                              if models:
-                                  htype = "sglang_native" if is_sglang else "openai_compatible"
-                                  return {"host": target, "ip": ip, "port": port, "type": htype, "models": models, "endpoint_path": path}
-                  except:
-                      pass
-              return None
-
-          async def run_prompt_test(session, host, port, m_name, p_label, p_text, ep_path):
-              is_ollama = (port == 11434)
-              if is_ollama:
-                  url = f"http://{host}/api/generate"
-                  payload = {"model": m_name, "prompt": p_text, "stream": False}
-              elif ep_path == "/openai/v1/models":
-                  url = f"http://{host}/openai/v1/chat/completions"
-                  payload = {"model": m_name, "messages": [{"role": "user", "content": p_text}], "max_tokens": 120, "temperature": 0.1}
-              elif ep_path == "/api/v1/models":
-                  url = f"http://{host}/api/v1/chat/completions"
-                  payload = {"model": m_name, "messages": [{"role": "user", "content": p_text}], "max_tokens": 120, "temperature": 0.1}
-              else:
-                  url = f"http://{host}/v1/chat/completions"
-                  payload = {"model": m_name, "messages": [{"role": "user", "content": p_text}], "max_tokens": 120, "temperature": 0.1}
-                  
-              try:
-                  async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=4.5, connect=2.0)) as r:
-                      if r.status == 200:
-                          data = await r.json()
-                          txt = data.get("response", "") if is_ollama else data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                          reasoning = data.get("choices", [{}])[0].get("message", {}).get("reasoning_content", "") if not is_ollama else ""
-                          res = (txt or reasoning).strip()
-                          if not res or len(res) < 1:
-                              return False
-                          if p_label == "logic_riddle":
-                              if "7" in res and not ("3" in res and res.index("3") < res.index("7")):
-                                  return True
-                              return False
-                          return True
-              except:
-                  pass
-              return False
-
-          async def validate_host(session, entry):
-              host = entry["host"]
-              port = entry["port"]
-              models = entry["models"]
-              ep_path = entry.get("endpoint_path", "/v1/models")
-              
-              working = []
-              for m in models[:40]: # Test up to 40 models per dense router
-                  m_name = m.get("name") if isinstance(m, dict) else str(m)
-                  passed = 0
-                  for p_label, p_text in PROMPTS:
-                      if await run_prompt_test(session, host, port, m_name, p_label, p_text, ep_path):
-                          passed += 1
-                      elif passed == 0:
-                          break
-                  if passed == 4:
-                      working.append({"name": m_name, "tier": "GOLD", "passed": 4})
-                  elif passed in (2, 3):
-                      working.append({"name": m_name, "tier": "SILVER", "passed": passed})
-                  elif passed == 1:
-                      working.append({"name": m_name, "tier": "BRONZE", "passed": 1})
-              
-              tier = "FAKE"
-              if any(m["tier"] == "GOLD" for m in working):
-                  tier = "GOLD"
-              elif any(m["tier"] == "SILVER" for m in working):
-                  tier = "SILVER"
-              elif any(m["tier"] == "BRONZE" for m in working):
-                  tier = "BRONZE"
-                  
-              return {
-                  "host": host,
-                  "ip": entry["ip"],
-                  "port": port,
-                  "type": entry["type"],
-                  "endpoint_path": ep_path,
-                  "total_models": len(models),
-                  "working_models_count": len(working),
-                  "working_models": working,
-                  "tier": tier
-              }
-
-          async def main_pipeline():
-              connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300)
-              async with aiohttp.ClientSession(connector=connector) as session:
-                  print("⚡ Stage 1: Async In-Runner Multi-Path Probing (/v1/models, /api/v1/models, /model/info)...")
-                  tasks = [probe_target(session, t) for t in target_set]
-                  discovered = [res for res in await asyncio.gather(*tasks) if res]
-                  print(f"✨ Found {len(discovered)} model-bearing hosts.")
-
-                  print("🧪 Stage 2: Deep 4-Prompt Validation on Runner...")
-                  val_tasks = [validate_host(session, h) for h in discovered]
-                  validated = await asyncio.gather(*val_tasks)
-
-                  gold = [v for v in validated if v["tier"] == "GOLD"]
-                  silver = [v for v in validated if v["tier"] == "SILVER"]
-                  print(f"\n🎉 Validation Complete: {len(gold)} GOLD, {len(silver)} SILVER out of {len(validated)} hosts.")
-
-                  with open("validated_compute.json", "w") as f:
-                      json.dump(validated, f, indent=2)
-
-          asyncio.run(main_pipeline())
-          EOF
-
-      - name: Stage 3 — v2 Hardening Pass (replay/alias/streaming forensics on GOLD+SILVER)
-        run: |
-          python3 - << 'EOF'
-          import json, subprocess, sys
-          try:
-              data = json.load(open("validated_compute.json"))
-          except Exception:
-              sys.exit(0)
-          candidates = [v["host"] for v in data if v.get("tier") in ("GOLD", "SILVER")]
-          if not candidates:
-              print("No GOLD/SILVER candidates — skipping v2 pass.")
-              sys.exit(0)
-          print(f"🔬 v2 hardening pass on {len(candidates)} GOLD/SILVER hosts...")
-          r = subprocess.run([sys.executable, "validate_v2.py",
-                              "--hosts", ",".join(candidates),
-                              "--models", "3", "--workers", "8", "--timeout", "12",
-                              "-o", "validated_compute_v2.json"],
-                             capture_output=True, text=True)
-          print(r.stdout[-3000:])
-          if r.returncode != 0:
-              print("v2 pass errored (non-fatal):", r.stderr[-500:])
-          EOF
+          python3 validate_v2.py \
+            --hosts hits.json \
+            --models 0 \
+            --workers 32 \
+            --timeout 10 \
+            -o validated_compute.json
 
       - name: Upload Validated Compute Artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: batch-validated-compute-${{ github.run_id }}
           path: |
             validated_compute.json
-            validated_compute_v2.json
-            non_llm_infra.json
+            validated_compute.jsonl
             hits.json
