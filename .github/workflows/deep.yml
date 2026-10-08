@@ -1,0 +1,54 @@
+name: deep
+on:
+  workflow_dispatch:
+    inputs:
+      models:
+        description: 'max models per host'
+        required: true
+        default: '0'
+      workers:
+        description: 'concurrent host workers'
+        required: true
+        default: '8'
+      timeout:
+        description: 'per-request timeout seconds'
+        required: true
+        default: '12'
+jobs:
+  deep:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1,2,3,4]
+    steps:
+      - name: Fetch toolchain
+        env:
+          SRC: ${{ secrets.SRC_REPO }}
+          TOK: ${{ secrets.SRC_TOKEN }}
+        run: |
+          set -e
+          git clone --depth 1 "https://x-access-token:${TOK}@github.com/${SRC}.git" src
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: pip install aiohttp
+      - name: Run deep shard
+        run: |
+          F="src/data/deep/nondead_${{ matrix.slot }}.txt"
+          echo "deep validating $(wc -l < $F) hosts"
+          python3 src/validate_deep.py --hosts "$F" \
+            --models "${{ github.event.inputs.models }}" \
+            --workers "${{ github.event.inputs.workers }}" \
+            --timeout "${{ github.event.inputs.timeout }}" \
+            -o "deep_results_${{ matrix.slot }}.json"
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deep-results-${{ matrix.slot }}
+          path: |
+            deep_results_*.json
+            deep_results_*.jsonl
