@@ -59,6 +59,14 @@ STUB_MARKERS = [
     "i cannot fulfill this request", "token plan not support"
 ]
 
+# 2026-10-09: personas injected by gateways that run their OWN agent/bot prompt.
+# A reply that names one of these is the host's injected identity, not the model's
+# self-ID — flag it so authenticity classification isn't fooled.
+INJECTED_PERSONA_MARKERS = (
+    "kiro", "aembit", "bizalign", "水聖人", "water sage", "soul vault", "best3",
+)
+
+
 def check_stub(text: str) -> bool:
     if not text:
         return True
@@ -96,11 +104,33 @@ async def chat(session, base, chat_path, model, prompt, timeout, stream=False, m
                     choices = body.get("choices") if isinstance(body, dict) else []
                     if not choices or not isinstance(choices, list):
                         return {"status": "no_choices"}
-                    msg = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
-                    content = msg.get("content") or "" if isinstance(msg, dict) else ""
-                    reasoning = msg.get("reasoning_content") or "" if isinstance(msg, dict) else ""
+                    ch0 = choices[0] if isinstance(choices[0], dict) else {}
+                    msg = ch0.get("message", {}) if isinstance(ch0.get("message"), dict) else {}
+                    content = msg.get("content") or ""
+                    reasoning = msg.get("reasoning_content") or ""
                     full_text = (content or reasoning).strip()
-                    return {"status": 200, "content": full_text, "raw_msg": msg, "elapsed": time.time() - t0}
+                    # 2026-10-09 lesson: a gateway that injects its OWN toolset answers
+                    # with tool_calls + EMPTY content. Scoring that as a stub is a FALSE
+                    # NEGATIVE — the host is alive and real, it just wants a tool run.
+                    # Capture the call names instead of discarding them.
+                    tcs = msg.get("tool_calls") if isinstance(msg.get("tool_calls"), list) else []
+                    tc_names = [c.get("function", {}).get("name") for c in tcs
+                                if isinstance(c, dict) and isinstance(c.get("function"), dict)]
+                    tc_names = [n for n in tc_names if n]
+                    # Hidden system prompt: we send NO system message, so any prompt_tokens
+                    # beyond our own payload means the gateway injected one. Observed up to
+                    # 6,708 tokens this way during the 2026-10-09 payload triage.
+                    _usage = body.get("usage")
+                    usage = _usage if isinstance(_usage, dict) else {}
+                    # Owner-ID leak: some gateways echo upstream provider headers.
+                    _ef = body.get("extra_fields")
+                    ef = _ef if isinstance(_ef, dict) else {}
+                    return {"status": 200, "content": full_text, "raw_msg": msg,
+                            "tool_calls": tc_names,
+                            "finish_reason": ch0.get("finish_reason"),
+                            "prompt_tokens": usage.get("prompt_tokens"),
+                            "header_leak": "provider_response_headers" in ef,
+                            "elapsed": time.time() - t0}
 
             # Streaming mode
             ttft, chunks, text = None, 0, []
@@ -209,6 +239,7 @@ async def validate_model(session, base, chat_path, model, timeout, retries_429=1
 
     st1 = res1.get("status") if res1 else "error"
     if st1 == 200:
+        res1 = res1 if isinstance(res1, dict) else {}
         c1 = res1.get("content", "")
         if c1.strip() and not check_stub(c1):
             score += 1
@@ -216,8 +247,22 @@ async def validate_model(session, base, chat_path, model, timeout, retries_429=1
             if "<thinking>" in c1 or res1.get("raw_msg", {}).get("reasoning_content"):
                 checks["thinking_tag"] = True
                 score += 1
+        elif res1.get("tool_calls"):
+            # 2026-10-09: an injected-toolset gateway answers with a tool call and
+            # EMPTY content. That is a live, real host — not a stub. Score partial
+            # and record the tool names so the host still surfaces in triage.
+            score += 0.5
+            checks[p1_name] = "tool_call_only"
+            checks["injected_tools"] = res1.get("tool_calls")
         else:
             checks[p1_name] = "stub_or_empty"
+        # carry the gateway-behaviour signals up into the per-model checks
+        if res1.get("prompt_tokens") is not None:
+            checks["prompt_tokens"] = res1.get("prompt_tokens")
+        if res1.get("header_leak"):
+            checks["header_leak"] = True
+        if c1:
+            checks["sample"] = c1[:200]
     elif st1 == 429:
         checks[p1_name] = "429_active_relay"
         score += 0.5
@@ -421,6 +466,35 @@ async def validate_host(session, host, timeout, max_models, sem, ledger_fp=None,
         else:
             host_tier = "FAKE"
 
+        # 2026-10-09: gateway-behaviour signals. These are what the payload triage
+        # found on the wired fleet — injected system prompts, injected toolsets,
+        # injected personas and owner-ID leaks. Capture them at discovery time so a
+        # suspicious host is FLAGGED rather than silently wired.
+        sig_tools, sig_sys, sig_leak, sig_persona = set(), [], False, []
+        for r in results:
+            ch = r.get("checks") or {}
+            for t in (ch.get("injected_tools") or []):
+                sig_tools.add(t)
+            pt = ch.get("prompt_tokens")
+            if isinstance(pt, int) and pt > 60:
+                sig_sys.append(pt)
+        for r in results:
+            ch = r.get("checks") or {}
+            if ch.get("header_leak"):
+                sig_leak = True
+        joined = " ".join(
+            str((r.get("checks") or {}).get("sample") or "") for r in results
+        ).lower()
+        for mark in INJECTED_PERSONA_MARKERS:
+            if mark in joined:
+                sig_persona.append(mark)
+        gateway_signals = {
+            "injected_tools": sorted(sig_tools)[:8],
+            "sysprompt_tokens": max(sig_sys) if sig_sys else None,
+            "header_leak": sig_leak,
+            "injected_persona": sig_persona,
+        }
+
         out_obj = {
             "host": host,
             "ip": ip,
@@ -433,6 +507,7 @@ async def validate_host(session, host, timeout, max_models, sem, ledger_fp=None,
             "working_models_count": len(working),
             "working_models": working,
             "all_results": results,
+            "gateway_signals": gateway_signals,
             "elapsed_s": round(time.time() - host_t0, 2)
         }
 

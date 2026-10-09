@@ -104,7 +104,11 @@ async def validate_model_deep(session, base, chat_path, model, timeout):
 
     # ---- Run all 10 prompts ----
     for name, prompt, verify in DEEP_PROMPTS:
-        res = await chat(session, base, chat_path, model, prompt, timeout, max_tokens=400)
+        # 2026-10-09: 400 starved reasoning models (they spend the whole budget on a
+        # thinking preamble and return EMPTY content -> read as "unverifiable" when it
+        # was really "starved"). 4096 + the reasoning_content fallback in chat()
+        # recovered 105/129 stragglers and exposed +85 mismatches last campaign.
+        res = await chat(session, base, chat_path, model, prompt, timeout, max_tokens=4096)
         st = res.get("status") if isinstance(res, dict) else "error"
         if st == 200:
             content = res.get("content", "") if isinstance(res, dict) else ""
@@ -123,8 +127,15 @@ async def validate_model_deep(session, base, chat_path, model, timeout):
                 if "<thinking>" in content or (isinstance(res, dict) and res.get("raw_msg", {}).get("reasoning_content")):
                     checks["thinking_tag"] = True
                     score += 1
+            elif isinstance(res, dict) and res.get("tool_calls"):
+                # injected-toolset gateway: alive and real, answered with a tool call
+                score += 0.5
+                checks[name] = "tool_call_only"
+                checks["injected_tools"] = res.get("tool_calls")
             else:
                 checks[name] = "stub_or_empty"
+            if isinstance(res, dict) and res.get("header_leak"):
+                checks["header_leak"] = True
         elif st == 429:
             checks[name] = "429_active_relay"
             score += 0.5
