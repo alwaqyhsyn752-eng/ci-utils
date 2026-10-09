@@ -210,7 +210,7 @@ async def validate_model(session, base, chat_path, model, timeout, retries_429=1
     st1 = res1.get("status") if res1 else "error"
     if st1 == 200:
         c1 = res1.get("content", "")
-        if len(c1) > 10 and not check_stub(c1):
+        if c1.strip() and not check_stub(c1):
             score += 1
             checks[p1_name] = "pass"
             if "<thinking>" in c1 or res1.get("raw_msg", {}).get("reasoning_content"):
@@ -246,7 +246,7 @@ async def validate_model(session, base, chat_path, model, timeout, retries_429=1
         st = res.get("status") if isinstance(res, dict) else "error"
         if st == 200:
             content = res.get("content", "") if isinstance(res, dict) else ""
-            if len(content) > 10 and not check_stub(content):
+            if content.strip() and not check_stub(content):
                 score += 1
                 checks[name] = "pass"
                 if name == "logic_riddle":

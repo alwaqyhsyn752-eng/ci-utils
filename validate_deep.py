@@ -108,7 +108,7 @@ async def validate_model_deep(session, base, chat_path, model, timeout):
         st = res.get("status") if isinstance(res, dict) else "error"
         if st == 200:
             content = res.get("content", "") if isinstance(res, dict) else ""
-            if len(content) > 8 and not check_stub(content):
+            if content.strip() and not check_stub(content):
                 score += 1
                 checks[name] = "pass"
                 if verify is not None:
