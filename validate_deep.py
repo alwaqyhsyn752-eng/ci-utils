@@ -136,6 +136,8 @@ async def validate_model_deep(session, base, chat_path, model, timeout):
                 checks[name] = "stub_or_empty"
             if isinstance(res, dict) and res.get("header_leak"):
                 checks["header_leak"] = True
+            if isinstance(res, dict) and res.get("prompt_tokens") is not None:
+                checks["prompt_tokens"] = res.get("prompt_tokens")
         elif st == 429:
             checks[name] = "429_active_relay"
             score += 0.5
