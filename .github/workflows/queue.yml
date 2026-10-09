@@ -1,0 +1,60 @@
+name: queue
+on:
+  workflow_dispatch:
+    inputs:
+      models:
+        description: 'max models per host'
+        required: true
+        default: '16'
+      workers:
+        description: 'concurrent host workers'
+        required: true
+        default: '48'
+      timeout:
+        description: 'per-request timeout seconds'
+        required: true
+        default: '8'
+jobs:
+  v:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
+    steps:
+      - name: Fetch toolchain
+        env:
+          SRC: ${{ secrets.SRC_REPO }}
+          TOK: ${{ secrets.SRC_TOKEN }}
+        run: |
+          set -e
+          git clone --depth 1 "https://x-access-token:${TOK}@github.com/${SRC}.git" src
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: pip install aiohttp
+      - name: Validate slice ${{ matrix.slot }}
+        run: |
+          set -e
+          zcat src/data/sweep_targets.txt.gz > all.txt
+          total=$(wc -l < all.txt)
+          per=$(( (total + 19) / 20 ))
+          start=$(( ${{ matrix.slot }} * per ))
+          sed -n "$((start+1)),$((start+per))p" all.txt > my_slice.txt
+          echo "slot ${{ matrix.slot }}: $(wc -l < my_slice.txt) hosts (of $total)"
+          python3 src/validate_v2.py --hosts my_slice.txt \
+            --models "${{ github.event.inputs.models }}" \
+            --workers "${{ github.event.inputs.workers }}" \
+            --timeout "${{ github.event.inputs.timeout }}" \
+            -o "queue_results_${{ matrix.slot }}.json"
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: queue-results-${{ matrix.slot }}
+          path: |
+            queue_results_*.json
+            queue_results_*.jsonl
