@@ -1,0 +1,48 @@
+name: sweep4
+
+on:
+  workflow_dispatch:
+    inputs:
+      ports:
+        description: 'ports'
+        required: true
+        default: '8000,8080,3000,3001,3002,3003,3004,3005,4000,30000,8081,8082,8088,8089,8090,5000,5001,8001,8002,6333,2375,1234,11434,7860,7861,8888,2718,5002,9000,9200,5678,8501'
+      rate:
+        description: 'packets per second'
+        required: true
+        default: '12500'
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39]
+    steps:
+      - name: Fetch toolchain
+        env:
+          SRC: ${{ secrets.SRC_REPO }}
+          TOK: ${{ secrets.SRC_TOKEN }}
+        run: |
+          set -e
+          git clone --depth 1 "https://x-access-token:${TOK}@github.com/${SRC}.git" src
+      - name: Install scan tool
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq masscan
+      - name: Run shard ${{ matrix.slot }}
+        run: |
+          F="src/data/sweep4/shard_${{ matrix.slot }}.txt"
+          echo "shard ${{ matrix.slot }}: $(wc -l < $F) cidrs"
+          sudo masscan -iL "$F" -p${{ github.event.inputs.ports }} \
+            --rate ${{ github.event.inputs.rate }} \
+            --wait 3 -oJ "hits_${{ matrix.slot }}.json" || true
+          echo "hits: $(grep -c '\"ip\"' hits_${{ matrix.slot }}.json 2>/dev/null || echo 0)"
+      - name: Upload hits
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sweep4-hits-${{ matrix.slot }}
+          path: hits_${{ matrix.slot }}.json
