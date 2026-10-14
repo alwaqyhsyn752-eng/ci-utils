@@ -10,6 +10,7 @@ Usage:
 """
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -104,7 +105,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--hosts", required=True, help="comma-separated host:port list")
     ap.add_argument("--model", required=True)
+    ap.add_argument("--force-bare-host", action="store_true", help="Explicitly allow running directly on bare host (DANGEROUS)")
     args = ap.parse_args()
+
+    # Operator Egress Guard: Never run bulk scan validation on bare residential host!
+    if not os.environ.get("GITHUB_ACTIONS") and not args.force_bare_host:
+        sys.exit(
+            "🚨 FATAL OPERATOR SAFETY VIOLATION: validate_hosts.py must run on GitHub Actions hosted runners,\n"
+            "NOT directly on the bare residential host! Running this locally burns the operator's home IP.\n"
+            "If you intentionally want to test a single host locally, pass --force-bare-host."
+        )
 
     hosts = [h.strip() for h in args.hosts.split(",") if h.strip()]
     print(f"validating {len(hosts)} hosts for model={args.model}", flush=True)

@@ -253,7 +253,16 @@ async def main():
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--timeout", type=float, default=12.0)
     ap.add_argument("-o", "--out", default="validate_deep_results.json")
+    ap.add_argument("--force-bare-host", action="store_true", help="Explicitly allow running directly on bare host (DANGEROUS)")
     args = ap.parse_args()
+
+    # Operator Egress Guard: Never run bulk scan validation on bare residential host!
+    if not os.environ.get("GITHUB_ACTIONS") and not args.force_bare_host:
+        sys.exit(
+            "🚨 FATAL OPERATOR SAFETY VIOLATION: validate_deep.py must run on GitHub Actions hosted runners,\n"
+            "NOT directly on the bare residential host! Running this locally burns the operator's home IP.\n"
+            "If you intentionally want to test a single host locally, pass --force-bare-host."
+        )
 
     hi = args.hosts.strip()
     if os.path.isfile(hi):

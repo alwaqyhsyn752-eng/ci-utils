@@ -26,18 +26,29 @@ import os
 import sys
 from collections import defaultdict
 
-HITS_DIR = os.environ.get("HITS_DIR", "/home/rumoto/workspace/recon/wave4/hits")
-OUT_DIR = os.environ.get("OUT_DIR", "/home/rumoto/workspace/recon/wave4")
+HITS_DIR = os.environ.get("HITS_DIR", "./hits")
+OUT_DIR = os.environ.get("OUT_DIR", ".")
 
 # Hosts answering on >= this many of our scanned ports are middleboxes.
 MIDDLEBOX_PORTS = int(os.environ.get("MIDDLEBOX_PORTS", "10"))
 
-# Probe order for stage 2: most gateway-dense ports first (wave-3 yield).
+# Probe order for stage 2: most gateway-dense ports first (wave-3 + batch25 yield + proxy/tunnel ports).
 PORT_PRIORITY = [
-    8080, 3000, 8000, 5000, 8081, 5001, 8001, 8002, 8082, 8088, 8089, 8090,
-    3001, 3002, 3003, 3004, 3005, 4000, 30000, 11434, 7860, 7861, 1234, 2718,
-    5002, 9000, 9200, 5678, 8501, 8888, 6333, 2375,
+    8080, 3000, 8000, 5000, 8081, 5001, 8001, 8002, 8005, 8082, 8085, 8086,
+    8088, 8089, 8090, 8100, 8125, 8126, 3001, 3002, 3003, 3004, 3005, 4000,
+    30000, 1234, 18081, 18082, 23333, 52444, 8443, 443, 80, 11434, 7860,
+    7861, 2718, 5002, 9000, 9001, 9200, 5678, 8501, 8888, 6333, 2375,
+    7890, 7891, 10808, 10809, 1080, 2080, 3128, 8118,
 ]
+
+# High-value LLM/router/infra/proxy ports that should ALL be emitted when open on a clean IP
+MULTI_EMIT_PORTS = {
+    3000, 3001, 3002, 3003, 3004, 3005, 4000, 5000, 5001, 5002,
+    7860, 7861, 8000, 8001, 8002, 8005, 8080, 8081, 8082, 8085,
+    8086, 8088, 8089, 8090, 8100, 8125, 8126, 8443, 8888, 9000,
+    9001, 1234, 18081, 18082, 23333, 30000, 52444, 2375,
+    7890, 7891, 10808, 10809, 1080, 2080, 3128, 8118,
+}
 
 
 def load_hits(path: str) -> list:
@@ -95,6 +106,16 @@ def pick_probe_port(ports) -> int:
     return min(available)
 
 
+def pick_probe_ports(ports) -> list[int]:
+    """Return all high-yield LLM/router ports open on a candidate host (ordered by priority),
+    falling back to [pick_probe_port(ports)] if only generic ports (e.g. 80/443) are open."""
+    available = set(ports)
+    ordered_hv = [p for p in PORT_PRIORITY if p in available and p in MULTI_EMIT_PORTS]
+    if ordered_hv:
+        return ordered_hv
+    return [pick_probe_port(available)]
+
+
 def main() -> int:
     files = sorted(glob.glob(f"{HITS_DIR}/**/hits_*.json", recursive=True))
     if not files:
@@ -126,10 +147,11 @@ def main() -> int:
         for ip, ps in sorted(middleboxes.items(), key=lambda kv: -len(kv[1])):
             fh.write(json.dumps({"ip": ip, "port_count": len(ps),
                                  "ports": sorted(ps)}) + "\n")
-    # one probe target per candidate host, best port first -> feeds validate_v2.py
+    # Emit all high-yield LLM/router ports per candidate host -> feeds validate_v2.py
     with open(f"{OUT_DIR}/hosts_pass1.txt", "w") as fh:
         for ip, ps in candidates.items():
-            fh.write(f"{ip}:{pick_probe_port(ps)}\n")
+            for p in pick_probe_ports(ps):
+                fh.write(f"{ip}:{p}\n")
 
     print(f"\nwrote {OUT_DIR}/candidates_clean.jsonl  <- real servers")
     print(f"wrote {OUT_DIR}/middleboxes.jsonl      <- dropped noise")
